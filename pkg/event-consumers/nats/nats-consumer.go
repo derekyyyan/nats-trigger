@@ -21,7 +21,7 @@ import (
 
 	"sync"
 
-	"github.com/kubeless/kubeless/pkg/utils"
+	"github.com/kubeless/kafka-trigger/pkg/utils"
 	"github.com/nats-io/go-nats"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
@@ -60,9 +60,13 @@ func createConsumerProcess(topic, funcName, ns, queueGroupID string, clientset k
 	subscription, err := nc.QueueSubscribe(topic, queueGroupID, func(msg *nats.Msg) {
 		logrus.Debugf("Received Message %v on Topic: %v Queue: %v", string(msg.Data), msg.Subject, msg.Sub.Queue)
 		logrus.Infof("Sending message %s to function %s", string(msg.Data), funcName)
-		req, err := utils.GetHTTPReq(clientset, funcName, ns, "natstriggers.kubeless.io", "POST", string(msg.Data))
+		funcPort, err := utils.GetFunctionPort(clientset, ns, funcName)
 		if err != nil {
-			logrus.Errorf("Unable to elaborate request: %v", err)
+			logrus.Fatalf("Yikes! Cannot get function port (namespace = %v function = %v): %v", ns, funcName, err)
+		}
+		req, err := utils.GetHTTPReq(funcName, funcPort, topic, ns, "natstriggers.kubeless.io", "POST", string(msg.Data))
+		if err != nil {
+			logrus.Errorf("Oh no! Unable to elaborate request: %v", err)
 		} else {
 			//forward msg to function
 			err = utils.SendMessage(req)

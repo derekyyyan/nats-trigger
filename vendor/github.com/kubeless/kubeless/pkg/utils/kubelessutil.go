@@ -18,30 +18,52 @@ package utils
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
 	"strings"
-	"time"
+	"unicode/utf8"
 
 	monitoringv1alpha1 "github.com/coreos/prometheus-operator/pkg/client/monitoring/v1alpha1"
+	"github.com/ghodss/yaml"
 	kubelessApi "github.com/kubeless/kubeless/pkg/apis/kubeless/v1beta1"
 	"github.com/kubeless/kubeless/pkg/langruntime"
 	"github.com/sirupsen/logrus"
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
-	batchv1beta1 "k8s.io/api/batch/v1beta1"
-	"k8s.io/api/core/v1"
-	"k8s.io/api/extensions/v1beta1"
+	v1 "k8s.io/api/core/v1"
 	clientsetAPIExtensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
+
+// GetFunctionPort returns the port for a function service
+func GetFunctionPort(clientset kubernetes.Interface, namespace, functionName string) (string, error) {
+	svc, err := clientset.CoreV1().Services(namespace).Get(functionName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("Unable to find the service for function %s", functionName)
+	}
+	return strconv.Itoa(int(svc.Spec.Ports[0].Port)), nil
+}
+
+// IsJSON returns true if the string is json
+func IsJSON(s string) bool {
+	var js map[string]interface{}
+	return json.Unmarshal([]byte(s), &js) == nil
+
+}
 
 func appendToCommand(orig string, command ...string) string {
 	if len(orig) > 0 {
@@ -50,7 +72,7 @@ func appendToCommand(orig string, command ...string) string {
 	return strings.Join(command, " && ")
 }
 
-func getProvisionContainer(function, checksum, fileName, handler, contentType, runtime, prepareImage string, runtimeVolume, depsVolume v1.VolumeMount, lr *langruntime.Langruntimes) (v1.Container, error) {
+func getProvisionContainer(function, checksum, fileName, handler, contentType, runtime, prepareImage string, runtimeVolume, depsVolume v1.VolumeMount, resources v1.ResourceRequirements, lr *langruntime.Langruntimes) (v1.Container, error) {
 	prepareCommand := ""
 	originFile := path.Join(depsVolume.MountPath, fileName)
 
@@ -62,7 +84,7 @@ func getProvisionContainer(function, checksum, fileName, handler, contentType, r
 		originFile = decodedFile
 	} else if strings.Contains(contentType, "url") {
 		fromURLFile := "/tmp/func.fromurl"
-		prepareCommand = appendToCommand(prepareCommand, fmt.Sprintf("curl %s -L --silent --output %s", function, fromURLFile))
+		prepareCommand = appendToCommand(prepareCommand, fmt.Sprintf("curl '%s' -L --silent --output %s", function, fromURLFile))
 		originFile = fromURLFile
 	} else if strings.Contains(contentType, "text") || contentType == "" {
 		// Assumming that function is plain text
@@ -122,6 +144,7 @@ func getProvisionContainer(function, checksum, fileName, handler, contentType, r
 		Args:            []string{prepareCommand},
 		VolumeMounts:    []v1.VolumeMount{runtimeVolume, depsVolume},
 		ImagePullPolicy: v1.PullIfNotPresent,
+		Resources:       resources,
 	}, nil
 }
 
@@ -140,116 +163,6 @@ func hasDefaultLabel(labels map[string]string) bool {
 	return true
 }
 
-// CreateIngress creates ingress rule for a specific function
-func CreateIngress(client kubernetes.Interface, httpTriggerObj *kubelessApi.HTTPTrigger, or []metav1.OwnerReference) error {
-	funcSvc, err := client.CoreV1().Services(httpTriggerObj.ObjectMeta.Namespace).Get(httpTriggerObj.Spec.FunctionName, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("Unable to find the function internal service: %v", funcSvc)
-	}
-
-	ingress := &v1beta1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            httpTriggerObj.Name,
-			Namespace:       httpTriggerObj.Namespace,
-			OwnerReferences: or,
-			Labels:          addDefaultLabel(httpTriggerObj.ObjectMeta.Labels),
-		},
-		Spec: v1beta1.IngressSpec{
-			Rules: []v1beta1.IngressRule{
-				{
-					Host: httpTriggerObj.Spec.HostName,
-					IngressRuleValue: v1beta1.IngressRuleValue{
-						HTTP: &v1beta1.HTTPIngressRuleValue{
-							Paths: []v1beta1.HTTPIngressPath{
-								{
-									Path: "/" + httpTriggerObj.Spec.Path,
-									Backend: v1beta1.IngressBackend{
-										ServiceName: funcSvc.Name,
-										ServicePort: funcSvc.Spec.Ports[0].TargetPort,
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	ingressAnnotations := make(map[string]string)
-
-	// If exposed URL in the backend service differs from the specified path in the Ingress rule.
-	// Without a rewrite any request will return 404. Set the annotation ingress.kubernetes.io/rewrite-target
-	// to the path expected by the service
-	ingressAnnotations["nginx.ingress.kubernetes.io/rewrite-target"] = "/"
-
-	if len(httpTriggerObj.Spec.BasicAuthSecret) > 0 {
-		switch gateway := httpTriggerObj.Spec.Gateway; gateway {
-		case "nginx":
-			ingressAnnotations["kubernetes.io/ingress.class"] = "nginx"
-			ingressAnnotations["nginx.ingress.kubernetes.io/auth-secret"] = httpTriggerObj.Spec.BasicAuthSecret
-			ingressAnnotations["nginx.ingress.kubernetes.io/auth-type"] = "basic"
-			break
-		case "traefik":
-			ingressAnnotations["kubernetes.io/ingress.class"] = "traefik"
-			ingressAnnotations["ingress.kubernetes.io/auth-secret"] = httpTriggerObj.Spec.BasicAuthSecret
-			ingressAnnotations["ingress.kubernetes.io/auth-type"] = "basic"
-			break
-		case "kong":
-			return fmt.Errorf("Setting basic authentication with Kong is not yet supported")
-		}
-	}
-
-	if len(httpTriggerObj.Spec.TLSSecret) > 0 && httpTriggerObj.Spec.TLSAcme {
-		return fmt.Errorf("Can not create ingress object from HTTP trigger spec with both TLSSecret and IngressTLS specified")
-	}
-
-	//  secure an Ingress by specified secret that contains a TLS private key and certificate
-	if len(httpTriggerObj.Spec.TLSSecret) > 0 {
-		ingress.Spec.TLS = []v1beta1.IngressTLS{
-			{
-				SecretName: httpTriggerObj.Spec.TLSSecret,
-				Hosts:      []string{httpTriggerObj.Spec.HostName},
-			},
-		}
-	}
-
-	// add annotations and TLS configuration for kube-lego
-	if httpTriggerObj.Spec.TLSAcme {
-		ingressAnnotations["kubernetes.io/tls-acme"] = "true"
-		ingressAnnotations["nginx.ingress.kubernetes.io/ssl-redirect"] = "true"
-		ingress.Spec.TLS = []v1beta1.IngressTLS{
-			{
-				Hosts:      []string{httpTriggerObj.Spec.HostName},
-				SecretName: httpTriggerObj.Name + "-tls",
-			},
-		}
-	}
-	ingress.ObjectMeta.Annotations = ingressAnnotations
-	_, err = client.ExtensionsV1beta1().Ingresses(httpTriggerObj.Namespace).Create(ingress)
-	if err != nil && k8sErrors.IsAlreadyExists(err) {
-		var newIngress *v1beta1.Ingress
-		newIngress, err = client.ExtensionsV1beta1().Ingresses(httpTriggerObj.Namespace).Get(ingress.Name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		if !hasDefaultLabel(newIngress.ObjectMeta.Labels) {
-			return fmt.Errorf("Found a conflicting ingress object %s/%s. Aborting", httpTriggerObj.Namespace, httpTriggerObj.Name)
-		}
-		if len(ingress.ObjectMeta.Labels) > 0 {
-			newIngress.ObjectMeta.Labels = mergeMap(newIngress.ObjectMeta.Labels, ingress.ObjectMeta.Labels)
-		}
-		newIngress.ObjectMeta.OwnerReferences = or
-		newIngress.Spec = ingress.Spec
-		_, err = client.ExtensionsV1beta1().Ingresses(httpTriggerObj.Namespace).Update(newIngress)
-		if err != nil && k8sErrors.IsAlreadyExists(err) {
-			// The configmap may already exist and there is nothing to update
-			return nil
-		}
-	}
-	return err
-}
-
 func splitHandler(handler string) (string, string, error) {
 	str := strings.Split(handler, ".")
 	if len(str) != 2 {
@@ -266,7 +179,7 @@ func getFileName(handler, funcContentType, runtime string, lr *langruntime.Langr
 		return "", err
 	}
 	filename := modName
-	if funcContentType == "text" || funcContentType == "" || funcContentType == "url" {
+	if funcContentType == "text" || funcContentType == "" || funcContentType == "url" || funcContentType == "base64" {
 		// We can only guess the extension if the function is specified as plain text
 		runtimeInf, err := lr.GetRuntimeInfo(runtime)
 		if err == nil {
@@ -431,6 +344,12 @@ func populatePodSpec(funcObj *kubelessApi.Function, lr *langruntime.Langruntimes
 		},
 	)
 	// prepare init-containers if some function is specified
+
+	resources := v1.ResourceRequirements{}
+	if len(funcObj.Spec.Deployment.Spec.Template.Spec.InitContainers) > 0 {
+		resources = funcObj.Spec.Deployment.Spec.Template.Spec.InitContainers[0].Resources
+	}
+
 	if funcObj.Spec.Function != "" {
 		fileName, err := getFileName(funcObj.Spec.Handler, funcObj.Spec.FunctionContentType, funcObj.Spec.Runtime, lr)
 		if err != nil {
@@ -453,6 +372,7 @@ func populatePodSpec(funcObj *kubelessApi.Function, lr *langruntime.Langruntimes
 			provisionImage,
 			runtimeVolumeMount,
 			srcVolumeMount,
+			resources,
 			lr,
 		)
 		if err != nil {
@@ -472,18 +392,18 @@ func populatePodSpec(funcObj *kubelessApi.Function, lr *langruntime.Langruntimes
 
 	// ensure that the runtime is supported for installing dependencies
 	_, err := lr.GetRuntimeInfo(funcObj.Spec.Runtime)
+	envVars := []v1.EnvVar{}
+	if len(result.Containers) > 0 {
+		envVars = result.Containers[0].Env
+	}
 	if funcObj.Spec.Deps != "" && err != nil {
 		return fmt.Errorf("Unable to install dependencies for the runtime %s", funcObj.Spec.Runtime)
 	} else if funcObj.Spec.Deps != "" {
-		envVars := []v1.EnvVar{}
-		if len(result.Containers) > 0 {
-			envVars = result.Containers[0].Env
-		}
 		depsChecksum, err := getChecksum(funcObj.Spec.Deps)
 		if err != nil {
 			return fmt.Errorf("Unable to obtain dependencies checksum: %v", err)
 		}
-		depsInstallContainer, err := lr.GetBuildContainer(funcObj.Spec.Runtime, depsChecksum, envVars, runtimeVolumeMount)
+		depsInstallContainer, err := lr.GetBuildContainer(funcObj.Spec.Runtime, depsChecksum, envVars, runtimeVolumeMount, resources)
 		if err != nil {
 			return err
 		}
@@ -496,15 +416,15 @@ func populatePodSpec(funcObj *kubelessApi.Function, lr *langruntime.Langruntimes
 	}
 
 	// add compilation init container if needed
-	if lr.RequiresCompilation(funcObj.Spec.Runtime) {
-		_, funcName, err := splitHandler(funcObj.Spec.Handler)
-		compContainer, err := lr.GetCompilationContainer(funcObj.Spec.Runtime, funcName, runtimeVolumeMount)
-		if err != nil {
-			return err
-		}
+	_, funcName, _ := splitHandler(funcObj.Spec.Handler)
+	compContainer, err := lr.GetCompilationContainer(funcObj.Spec.Runtime, funcName, envVars, runtimeVolumeMount, resources)
+	if err != nil {
+		return err
+	}
+	if compContainer != nil {
 		result.InitContainers = append(
 			result.InitContainers,
-			compContainer,
+			*compContainer,
 		)
 	}
 	return nil
@@ -621,11 +541,11 @@ func EnsureFuncImage(client kubernetes.Interface, funcObj *kubelessApi.Function,
 	return err
 }
 
-func svcPort(funcObj *kubelessApi.Function) int32 {
+func svcTargetPort(funcObj *kubelessApi.Function) int32 {
 	if len(funcObj.Spec.ServiceSpec.Ports) == 0 {
 		return int32(8080)
 	}
-	return funcObj.Spec.ServiceSpec.Ports[0].Port
+	return int32(funcObj.Spec.ServiceSpec.Ports[0].TargetPort.IntValue())
 }
 
 func mergeMap(dst, src map[string]string) map[string]string {
@@ -651,7 +571,7 @@ func EnsureFuncDeployment(client kubernetes.Interface, funcObj *kubelessApi.Func
 		// "targets")
 		"prometheus.io/scrape": "true",
 		"prometheus.io/path":   "/metrics",
-		"prometheus.io/port":   strconv.Itoa(int(svcPort(funcObj))),
+		"prometheus.io/port":   strconv.Itoa(int(svcTargetPort(funcObj))),
 	}
 	maxUnavailable := intstr.FromInt(0)
 
@@ -663,8 +583,8 @@ func EnsureFuncDeployment(client kubernetes.Interface, funcObj *kubelessApi.Func
 		MatchLabels: funcObj.ObjectMeta.Labels,
 	}
 
-	dpm.Spec.Strategy = v1beta1.DeploymentStrategy{
-		RollingUpdate: &v1beta1.RollingUpdateDeployment{
+	dpm.Spec.Strategy = appsv1.DeploymentStrategy{
+		RollingUpdate: &appsv1.RollingUpdateDeployment{
 			MaxUnavailable: &maxUnavailable,
 		},
 	}
@@ -734,24 +654,26 @@ func EnsureFuncDeployment(client kubernetes.Interface, funcObj *kubelessApi.Func
 				Value: dpm.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String(),
 			},
 		)
+	} else {
+		logrus.Warn("Expected non-empty handler and non-empty function content")
 	}
 
 	dpm.Spec.Template.Spec.Containers[0].Env = append(dpm.Spec.Template.Spec.Containers[0].Env,
 		v1.EnvVar{
 			Name:  "FUNC_PORT",
-			Value: strconv.Itoa(int(svcPort(funcObj))),
+			Value: strconv.Itoa(int(svcTargetPort(funcObj))),
 		},
 	)
 
 	dpm.Spec.Template.Spec.Containers[0].Name = funcObj.ObjectMeta.Name
 	dpm.Spec.Template.Spec.Containers[0].Ports = append(dpm.Spec.Template.Spec.Containers[0].Ports, v1.ContainerPort{
-		ContainerPort: svcPort(funcObj),
+		ContainerPort: svcTargetPort(funcObj),
 	})
 
 	// update deployment for loading dependencies
 	lr.UpdateDeployment(dpm, runtimeVolumeMount.MountPath, funcObj.Spec.Runtime)
 
-	livenessProbeInfo := lr.GetLivenessProbeInfo(funcObj.Spec.Runtime, int(svcPort(funcObj)))
+	livenessProbeInfo := lr.GetLivenessProbeInfo(funcObj.Spec.Runtime, int(svcTargetPort(funcObj)))
 
 	if dpm.Spec.Template.Spec.Containers[0].LivenessProbe == nil {
 		dpm.Spec.Template.Spec.Containers[0].LivenessProbe = livenessProbeInfo
@@ -766,12 +688,34 @@ func EnsureFuncDeployment(client kubernetes.Interface, funcObj *kubelessApi.Func
 		}
 	}
 
-	_, err = client.ExtensionsV1beta1().Deployments(funcObj.ObjectMeta.Namespace).Create(dpm)
+	// Add soft pod anti affinity
+	if dpm.Spec.Template.Spec.Affinity == nil {
+		dpm.Spec.Template.Spec.Affinity = &v1.Affinity{
+			PodAntiAffinity: &v1.PodAntiAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: []v1.WeightedPodAffinityTerm{
+					{
+						Weight: 100,
+						PodAffinityTerm: v1.PodAffinityTerm{
+							LabelSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"created-by": "kubeless",
+									"function":   funcObj.ObjectMeta.Name,
+								},
+							},
+							TopologyKey: "kubernetes.io/hostname",
+						},
+					},
+				},
+			},
+		}
+	}
+
+	_, err = client.AppsV1().Deployments(funcObj.ObjectMeta.Namespace).Create(dpm)
 	if err != nil && k8sErrors.IsAlreadyExists(err) {
 		// In case the Deployment already exists we should update
 		// just certain fields (to avoid race conditions)
-		var newDpm *v1beta1.Deployment
-		newDpm, err = client.ExtensionsV1beta1().Deployments(funcObj.ObjectMeta.Namespace).Get(funcObj.ObjectMeta.Name, metav1.GetOptions{})
+		var newDpm *appsv1.Deployment
+		newDpm, err = client.AppsV1().Deployments(funcObj.ObjectMeta.Namespace).Get(funcObj.ObjectMeta.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -790,89 +734,12 @@ func EnsureFuncDeployment(client kubernetes.Interface, funcObj *kubelessApi.Func
 			return err
 		}
 		// Use `Patch` to do a rolling update
-		_, err = client.ExtensionsV1beta1().Deployments(funcObj.ObjectMeta.Namespace).Patch(newDpm.Name, types.MergePatchType, data)
+		_, err = client.AppsV1().Deployments(funcObj.ObjectMeta.Namespace).Patch(newDpm.Name, types.MergePatchType, data)
 		if err != nil {
 			return err
 		}
 	}
 
-	return err
-}
-
-// EnsureCronJob creates/updates a function cron job
-func EnsureCronJob(client kubernetes.Interface, funcObj *kubelessApi.Function, schedule, reqImage string, or []metav1.OwnerReference, reqImagePullSecret []v1.LocalObjectReference) error {
-	var maxSucccessfulHist, maxFailedHist int32
-	maxSucccessfulHist = 3
-	maxFailedHist = 1
-	var timeout int
-	if funcObj.Spec.Timeout != "" {
-		var err error
-		timeout, err = strconv.Atoi(funcObj.Spec.Timeout)
-		if err != nil {
-			return fmt.Errorf("Unable convert %s to a valid timeout", funcObj.Spec.Timeout)
-		}
-	} else {
-		timeout, _ = strconv.Atoi(defaultTimeout)
-	}
-	activeDeadlineSeconds := int64(timeout)
-	jobName := fmt.Sprintf("trigger-%s", funcObj.ObjectMeta.Name)
-	var headersString = ""
-	timestamp := time.Now().UTC()
-	eventID, err := GetRandString(11)
-	if err != nil {
-		return fmt.Errorf("Failed to create a event-ID %v", err)
-	}
-	headersString = headersString + " -H \"event-id: " + eventID + "\""
-	headersString = headersString + " -H \"event-time: " + timestamp.String() + "\""
-	headersString = headersString + " -H \"event-type: application/json\""
-	headersString = headersString + " -H \"event-namespace: cronjobtrigger.kubeless.io\""
-	job := &batchv1beta1.CronJob{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            jobName,
-			Namespace:       funcObj.ObjectMeta.Namespace,
-			Labels:          addDefaultLabel(funcObj.ObjectMeta.Labels),
-			OwnerReferences: or,
-		},
-		Spec: batchv1beta1.CronJobSpec{
-			Schedule:                   schedule,
-			SuccessfulJobsHistoryLimit: &maxSucccessfulHist,
-			FailedJobsHistoryLimit:     &maxFailedHist,
-			JobTemplate: batchv1beta1.JobTemplateSpec{
-				Spec: batchv1.JobSpec{
-					ActiveDeadlineSeconds: &activeDeadlineSeconds,
-					Template: v1.PodTemplateSpec{
-						Spec: v1.PodSpec{
-							ImagePullSecrets: reqImagePullSecret,
-							Containers: []v1.Container{
-								{
-									Image: reqImage,
-									Name:  "trigger",
-									Args:  []string{"curl", "-Lv", headersString, fmt.Sprintf("http://%s.%s.svc.cluster.local:8080", funcObj.ObjectMeta.Name, funcObj.ObjectMeta.Namespace)},
-								},
-							},
-							RestartPolicy: v1.RestartPolicyNever,
-						},
-					},
-				},
-			},
-		},
-	}
-
-	_, err = client.BatchV1beta1().CronJobs(funcObj.ObjectMeta.Namespace).Create(job)
-	if err != nil && k8sErrors.IsAlreadyExists(err) {
-		newCronJob := &batchv1beta1.CronJob{}
-		newCronJob, err = client.BatchV1beta1().CronJobs(funcObj.ObjectMeta.Namespace).Get(jobName, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		if !hasDefaultLabel(newCronJob.ObjectMeta.Labels) {
-			return fmt.Errorf("Found a conflicting cronjob object %s/%s. Aborting", funcObj.ObjectMeta.Namespace, funcObj.ObjectMeta.Name)
-		}
-		newCronJob.ObjectMeta.Labels = funcObj.ObjectMeta.Labels
-		newCronJob.ObjectMeta.OwnerReferences = or
-		newCronJob.Spec = job.Spec
-		_, err = client.BatchV1beta1().CronJobs(funcObj.ObjectMeta.Namespace).Update(newCronJob)
-	}
 	return err
 }
 
@@ -932,6 +799,23 @@ func GetOwnerReference(kind, apiVersion, name string, uid types.UID) ([]metav1.O
 	}, nil
 }
 
+// GetInClusterConfig returns necessary Config object to authenticate k8s clients if env variable is set
+func GetInClusterConfig() (*rest.Config, error) {
+	config, err := rest.InClusterConfig()
+
+	tokenFile := os.Getenv("KUBELESS_TOKEN_FILE_PATH")
+	if len(tokenFile) == 0 {
+		return config, err
+	}
+	tokenBytes, err := ioutil.ReadFile(tokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read file containing oauth token: %s", err)
+	}
+	config.BearerToken = string(tokenBytes)
+
+	return config, nil
+}
+
 func getConfigLocation(apiExtensionsClientset clientsetAPIExtensions.Interface) (ConfigLocation, error) {
 	configLocation := ConfigLocation{}
 	controllerNamespace := os.Getenv("KUBELESS_NAMESPACE")
@@ -973,4 +857,124 @@ func GetKubelessConfig(cli kubernetes.Interface, cliAPIExtensions clientsetAPIEx
 		return nil, fmt.Errorf("Unable to read the configmap: %s", err)
 	}
 	return config, nil
+}
+
+// DryRunFmt stringify the given interface in a specific format
+func DryRunFmt(format string, trigger interface{}) (string, error) {
+	switch format {
+	case "json":
+		j, err := json.MarshalIndent(trigger, "", "    ")
+		if err != nil {
+			return "", err
+		}
+		return string(j[:]), nil
+	case "yaml":
+		y, err := yaml.Marshal(trigger)
+		if err != nil {
+			return "", err
+		}
+		return string(y[:]), nil
+	default:
+		return "", fmt.Errorf("Output format needs to be yaml or json")
+	}
+}
+
+// GetContentType Gets the content type of a given filename
+func GetContentType(filename string) (string, error) {
+	var contentType string
+
+	if strings.Index(filename, "http://") == 0 || strings.Index(filename, "https://") == 0 {
+		contentType = "url"
+		if path.Ext(strings.Split(filename, "?")[0]) == ".zip" {
+			contentType += "+zip"
+		}
+	} else {
+		fbytes, err := ioutil.ReadFile(filename)
+		if err != nil {
+			return "", err
+		}
+		isText := utf8.ValidString(string(fbytes))
+		if isText {
+			contentType = "text"
+		} else {
+			contentType = "base64"
+			if path.Ext(filename) == ".zip" {
+				contentType += "+zip"
+			}
+		}
+	}
+	return contentType, nil
+}
+
+// ParseContent Parses the content of a file as string
+func ParseContent(file, contentType string) (string, string, error) {
+	var checksum, content string
+
+	if strings.Contains(contentType, "url") {
+
+		functionURL, err := url.Parse(file)
+		if err != nil {
+			return "", "", err
+		}
+		resp, err := http.Get(functionURL.String())
+		if err != nil {
+			return "", "", err
+		}
+		defer resp.Body.Close()
+
+		functionBytes, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return "", "", err
+		}
+		content = string(functionBytes)
+		checksum, err = getSha256(functionBytes)
+		if err != nil {
+			return "", "", err
+		}
+
+	} else {
+
+		functionBytes, err := ioutil.ReadFile(file)
+		if err != nil {
+			return "", "", err
+		}
+		if contentType == "text" {
+			content = string(functionBytes)
+		} else {
+			content = base64.StdEncoding.EncodeToString(functionBytes)
+		}
+		checksum, err = getFileSha256(file)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	return content, checksum, nil
+}
+
+// Get the checksum of a file using sha256
+func getFileSha256(file string) (string, error) {
+	h := sha256.New()
+	ff, err := os.Open(file)
+	if err != nil {
+		return "", err
+	}
+	defer ff.Close()
+	_, err = io.Copy(h, ff)
+	if err != nil {
+		return "", err
+	}
+	checksum := hex.EncodeToString(h.Sum(nil))
+	return "sha256:" + checksum, err
+}
+
+// Get the checksum using sha256
+func getSha256(bytes []byte) (string, error) {
+	h := sha256.New()
+	_, err := h.Write(bytes)
+	if err != nil {
+		return "", err
+	}
+	checksum := hex.EncodeToString(h.Sum(nil))
+	return "sha256:" + checksum, nil
 }
